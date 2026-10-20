@@ -1,0 +1,6 @@
+fly_in_venv/
+.fl_venv.py/
+__pycache__/
+.mypy_cache/
+.pytest_cache/
+*.pyc
