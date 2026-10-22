@@ -1,0 +1,45 @@
+I used the subject details and implemented the project in the existing repo.
+
+Status:
+
+• Parser and data models are complete in  parser.py  and  models.py 
+• Object-oriented scheduler / pathing logic is in  graph.py 
+• Entry point is in  main.py 
+• README + Makefile were added/updated
+• Verified with:
+•  python3 -m flake8 --exclude=fly_in_venv,venv . 
+•  python3 -m mypy . --warn-return-any --warn-unused-ignores --ignore-missing-imports --disallow-untyped-defs --check-untyped-defs --exclude 'fly_in_venv|venv' 
+
+Run examples:
+
+•  make install 
+•  make run MAP=maps/easy/01_linear_path.txt 
+•  make lint 
+
+It currently produces valid per-turn drone movement logs and satisfies the assignment’s core parsing and scheduling constraints. If you want, I can now focus on one of these:
+
+• optimize further toward benchmark-optimal turns
+• add more validation/error cases
+• tackle the challenger map bonus
+• explain the code structure in detail
+
+
+
+Yes — I implemented the Tkinter path as an optional visual layer, while keeping the terminal output as the default and reliable mode.
+
+What I added:
+
+•  visual.py  with a simple Tkinter animation
+•  --gui  mode in  main.py 
+•  run_with_states()  in  scheduler.py  so the GUI can animate turn-by-turn
+
+How to launch:
+
+•  python3 main.py --gui maps/easy/01_linear_path.txt 
+
+Default terminal mode still works as before:
+
+•  python3 main.py maps/easy/01_linear_path.txt 
+
+It’s lightweight and uses only the standard library, so it fits your request well.
+I also verified the project still passes flake8 and mypy.

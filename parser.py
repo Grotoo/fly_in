@@ -1,23 +1,28 @@
 import sys
 from typing import Callable
+
 from pydantic import ValidationError
-from models import Connection, Hub, Level
+
+from models import Connection, Hub, Level, ZoneType
 
 
 class ParseError(Exception):
-    pass
+    """Raised when the input map file cannot be parsed."""
 
 
-def format_validation_error(e: ValidationError) -> str:
-    parts = []
-    for err in e.errors():
-        field = ".".join(str(p) for p in err["loc"])
-        msg = err["msg"].removeprefix("Value error, ")
-        parts.append(f"{field}: {msg}" if field else msg)
+def format_validation_error(error: ValidationError) -> str:
+    """Convert a pydantic validation error into readable text."""
+    parts: list[str] = []
+    for err in error.errors():
+        field = ".".join(str(part) for part in err["loc"])
+        message = err["msg"].removeprefix("Value error, ")
+        parts.append(f"{field}: {message}" if field else message)
     return "; ".join(parts)
 
 
 class Parser:
+    """Parses a map file into a Level instance."""
+
     def __init__(self) -> None:
         self._reset()
         self.handlers: dict[str, Callable[[str], None]] = {
@@ -37,10 +42,11 @@ class Parser:
         self.end: str | None = None
 
     def parse(self, path: str) -> Level:
+        """Parse a level file from disk."""
         self._reset()
         first = True
-        with open(path, encoding="utf-8") as f:
-            for number, raw in enumerate(f, start=1):
+        with open(path, encoding="utf-8") as handle:
+            for number, raw in enumerate(handle, start=1):
                 line = raw.strip()
                 if not line or line.startswith("#"):
                     continue
@@ -58,12 +64,12 @@ class Parser:
                 first = False
                 try:
                     handler(value.strip())
-                except ValidationError as e:
+                except ValidationError as error:
                     raise ParseError(
-                        f"Line {number}: {format_validation_error(e)}"
-                    ) from e
-                except ValueError as e:
-                    raise ParseError(f"Line {number}: {e}") from e
+                        f"Line {number}: {format_validation_error(error)}"
+                    ) from error
+                except ValueError as error:
+                    raise ParseError(f"Line {number}: {error}") from error
 
         if self.nb_drones is None:
             raise ParseError("missing 'nb_drones'")
@@ -79,33 +85,35 @@ class Parser:
                 hubs=self.hubs,
                 connections=self.connections,
             )
-        except ValidationError as e:
-            raise ParseError(format_validation_error(e)) from e
+        except ValidationError as error:
+            raise ParseError(format_validation_error(error)) from error
 
-    # ---------- helpers ----------
     def parse_metadata(self, text: str) -> dict[str, str]:
+        """Parse a metadata block like [zone=priority color=red]."""
         meta: dict[str, str] = {}
         for pair in text.split():
             if "=" not in pair:
                 raise ValueError(f"bad metadata entry '{pair}'")
-            k, v = pair.split("=", 1)
-            if not k or not v:
+            key, value = pair.split("=", 1)
+            if not key or not value:
                 raise ValueError(f"bad metadata entry '{pair}'")
-            if k in meta:
-                raise ValueError(f"duplicate metadata key '{k}'")
-            meta[k] = v
+            if key in meta:
+                raise ValueError(f"duplicate metadata key '{key}'")
+            meta[key] = value
         return meta
 
     def split_meta(self, value: str) -> tuple[str, dict[str, str]]:
+        """Split a value into its raw content and metadata."""
         if "[" not in value:
             return value.strip(), {}
         main, meta = value.split("[", 1)
-        meta = meta.strip()
-        if not meta.endswith("]"):
+        metadata = meta.strip()
+        if not metadata.endswith("]"):
             raise ValueError("missing closing ']'")
-        return main.strip(), self.parse_metadata(meta[:-1])
+        return main.strip(), self.parse_metadata(metadata[:-1])
 
     def add_hub(self, value: str, terminal: bool = False) -> str:
+        """Create a hub from a raw line fragment."""
         main, meta = self.split_meta(value)
         parts = main.split()
         if len(parts) != 3:
@@ -114,56 +122,79 @@ class Parser:
         if name in self.hubs:
             raise ValueError(f"duplicate hub '{name}'")
         if terminal:
-            # max_drones is ignored on start/end hubs (per subject)
             meta.pop("max_drones", None)
-        self.hubs[name] = Hub(hub_name=name, loc_x=x, loc_y=y, **meta)
+
+        zone_value = meta.pop("zone", "normal")
+        color = meta.pop("color", None)
+        max_drones = int(meta.pop("max_drones", 1))
+        if meta:
+            unknown = ", ".join(sorted(meta))
+            raise ValueError(f"unknown hub metadata: {unknown}")
+
+        self.hubs[name] = Hub(
+            hub_name=name,
+            loc_x=int(x),
+            loc_y=int(y),
+            zone=ZoneType(zone_value),
+            color=color,
+            max_drones=max_drones,
+        )
         return name
 
-    # ---------- handlers ----------
     def handle_nb_drones(self, value: str) -> None:
+        """Handle the nb_drones header."""
         if self.nb_drones is not None:
             raise ValueError("nb_drones defined twice")
         try:
-            n = int(value)
+            count = int(value)
         except ValueError:
-            raise ValueError(
-                f"nb_drones must be an integer, got '{value}'"
-            ) from None
-        if n < 1:
+            raise ValueError(f"nb_drones must be an integer, got '{value}'")
+        if count < 1:
             raise ValueError("nb_drones must be a positive integer")
-        self.nb_drones = n
+        self.nb_drones = count
 
     def handle_start(self, value: str) -> None:
+        """Create the unique start hub."""
         if self.start is not None:
             raise ValueError("start_hub defined twice")
         self.start = self.add_hub(value, terminal=True)
 
     def handle_hub(self, value: str) -> None:
+        """Create a regular hub."""
         self.add_hub(value)
 
     def handle_end(self, value: str) -> None:
+        """Create the unique end hub."""
         if self.end is not None:
             raise ValueError("end_hub defined twice")
         self.end = self.add_hub(value, terminal=True)
 
     def handle_connection(self, value: str) -> None:
+        """Create a connection between two previously-defined hubs."""
         main, meta = self.split_meta(value)
         parts = main.split("-")
         if len(parts) != 2:
             raise ValueError(f"expected '<a>-<b>', got '{main}'")
-        a, b = parts[0].strip(), parts[1].strip()
-        for name in (a, b):
+        first, second = parts[0].strip(), parts[1].strip()
+        for name in (first, second):
             if name not in self.hubs:
                 raise ValueError(
-                    f"unknown zone '{name}' "
-                    "(define zones before connections)"
+                    f"unknown zone '{name}' (define zones before connections)"
                 )
-        key = frozenset((a, b))
+        key = frozenset((first, second))
         if key in self.connection_keys:
-            raise ValueError(f"duplicate connection {a}-{b}")
-        conn = Connection(point1=a, point2=b, **meta)
+            raise ValueError(f"duplicate connection {first}-{second}")
+        max_link_capacity = int(meta.pop("max_link_capacity", 1))
+        if meta:
+            unknown = ", ".join(sorted(meta))
+            raise ValueError(f"unknown connection metadata: {unknown}")
+        connection = Connection(
+            point1=first,
+            point2=second,
+            max_link_capacity=max_link_capacity,
+        )
         self.connection_keys.add(key)
-        self.connections.append(conn)
+        self.connections.append(connection)
 
 
 if __name__ == "__main__":
@@ -172,7 +203,7 @@ if __name__ == "__main__":
         sys.exit(1)
     try:
         level = Parser().parse(sys.argv[1])
-    except (OSError, ParseError) as e:
-        print(f"Error: {e}")
+    except (OSError, ParseError) as error:
+        print(f"Error: {error}")
         sys.exit(1)
     print(level.model_dump_json(indent=2))
