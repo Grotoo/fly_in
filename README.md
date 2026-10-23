@@ -64,7 +64,7 @@ make lint-strict
 make clean
 ```
 
-## Algorithm and implementation strategy
+## Algorithm explanation
 
 The simulator is structured in three layers:
 
