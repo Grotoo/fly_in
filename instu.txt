@@ -43,3 +43,29 @@ Default terminal mode still works as before:
 
 It’s lightweight and uses only the standard library, so it fits your request well.
 I also verified the project still passes flake8 and mypy.
+
+
+
+
+
+benchmark
+
+easy
+01_linear_path Turns = 4 y  
+02_simple_fork Turns = 6 n op 4
+03_basic_capacity Turns = 4 y 
+
+
+medium
+01_dead_end_trap Turns = 8 y 
+02_circular_loop Turns = 9 y 
+03_priority_puzzle Turns = 8 y op 6
+
+
+hard
+01_maze_nightmare Turns = 13 y 
+02_capacity_hell Turns = 18 y  op 6
+03_ultimate_challenge Turns = 26 y 
+
+challenger
+01 Turns = 43
