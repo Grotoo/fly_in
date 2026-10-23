@@ -45,6 +45,7 @@ class Parser:
         """Parse a level file from disk."""
         self._reset()
         first = True
+        pending_connections: list[tuple[int, str]] = []
         with open(path, encoding="utf-8") as handle:
             for number, raw in enumerate(handle, start=1):
                 line = raw.strip()
@@ -62,6 +63,9 @@ class Parser:
                         f"Line {number}: first line must define nb_drones"
                     )
                 first = False
+                if key == "connection":
+                    pending_connections.append((number, value.strip()))
+                    continue
                 try:
                     handler(value.strip())
                 except ValidationError as error:
@@ -77,6 +81,15 @@ class Parser:
             raise ParseError("missing 'start_hub'")
         if self.end is None:
             raise ParseError("missing 'end_hub'")
+        for number, value in pending_connections:
+            try:
+                self.handle_connection(value)
+            except ValidationError as error:
+                raise ParseError(
+                    f"Line {number}: {format_validation_error(error)}"
+                ) from error
+            except ValueError as error:
+                raise ParseError(f"Line {number}: {error}") from error
         try:
             return Level(
                 nb_drones=self.nb_drones,
@@ -126,16 +139,39 @@ class Parser:
 
         zone_value = meta.pop("zone", "normal")
         color = meta.pop("color", None)
-        max_drones = int(meta.pop("max_drones", 1))
+        max_drones_value = meta.pop("max_drones", "1")
+        try:
+            max_drones = int(max_drones_value)
+        except ValueError:
+            raise ValueError(
+                f"max_drones must be an integer, got '{max_drones_value}'"
+            )
+        if max_drones < 1:
+            raise ValueError("max_drones must be a positive integer")
         if meta:
             unknown = ", ".join(sorted(meta))
             raise ValueError(f"unknown hub metadata: {unknown}")
 
+        try:
+            loc_x = int(x)
+        except ValueError:
+            raise ValueError(f"x coordinate must be an integer, got '{x}'")
+        try:
+            loc_y = int(y)
+        except ValueError:
+            raise ValueError(f"y coordinate must be an integer, got '{y}'")
+        try:
+            zone = ZoneType(zone_value)
+        except ValueError:
+            allowed = ", ".join(zone.value for zone in ZoneType)
+            raise ValueError(
+                f"invalid zone type '{zone_value}'; expected one of: {allowed}"
+            )
         self.hubs[name] = Hub(
             hub_name=name,
-            loc_x=int(x),
-            loc_y=int(y),
-            zone=ZoneType(zone_value),
+            loc_x=loc_x,
+            loc_y=loc_y,
+            zone=zone,
             color=color,
             max_drones=max_drones,
         )
@@ -176,6 +212,10 @@ class Parser:
         if len(parts) != 2:
             raise ValueError(f"expected '<a>-<b>', got '{main}'")
         first, second = parts[0].strip(), parts[1].strip()
+        if first == second:
+            raise ValueError(
+                f"self-connection {first}-{second} is not allowed"
+            )
         for name in (first, second):
             if name not in self.hubs:
                 raise ValueError(
@@ -184,7 +224,16 @@ class Parser:
         key = frozenset((first, second))
         if key in self.connection_keys:
             raise ValueError(f"duplicate connection {first}-{second}")
-        max_link_capacity = int(meta.pop("max_link_capacity", 1))
+        max_link_capacity_value = meta.pop("max_link_capacity", "1")
+        try:
+            max_link_capacity = int(max_link_capacity_value)
+        except ValueError:
+            raise ValueError(
+                "max_link_capacity must be an integer, "
+                f"got '{max_link_capacity_value}'"
+            )
+        if max_link_capacity < 1:
+            raise ValueError("max_link_capacity must be a positive integer")
         if meta:
             unknown = ", ".join(sorted(meta))
             raise ValueError(f"unknown connection metadata: {unknown}")

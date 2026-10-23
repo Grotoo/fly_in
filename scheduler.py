@@ -37,6 +37,47 @@ class Simulation:
         """Compute the shortest valid route for a drone."""
         return self.graph.shortest_path(self.level.start, self.level.end)
 
+    def _routes_for_drones(self) -> list[list[str]]:
+        """Assign routes using schedule-aware greedy selection."""
+        candidates = self.graph.all_paths(self.level.start, self.level.end)
+        if not candidates:
+            raise ValueError(
+                f"No valid path connects '{self.level.start}' "
+                f"to '{self.level.end}' in this map."
+            )
+        shortest_cost = self.graph.path_score(candidates[0])[0]
+        candidates = [
+            route
+            for route in candidates
+            if self.graph.path_score(route)[0] <= shortest_cost + 1
+        ]
+
+        baseline = min(
+            candidates,
+            key=lambda route: self._simulate(
+                [route] * self.level.nb_drones
+            )[0],
+        )
+        routes: list[list[str]] = [baseline]
+        for _ in range(1, self.level.nb_drones):
+            best_route = candidates[0]
+            best_result: tuple[int, int, tuple[int, int, int]] | None = None
+            for candidate in candidates:
+                try:
+                    turns = self._simulate(routes + [candidate])[0]
+                except RuntimeError:
+                    continue
+                result = (
+                    turns,
+                    sum(route == candidate for route in routes),
+                    self.graph.path_score(candidate),
+                )
+                if best_result is None or result < best_result:
+                    best_result = result
+                    best_route = candidate
+            routes.append(best_route)
+        return routes
+
     def _route_index(self, route: list[str], position: str) -> int:
         """Find the index of position inside route."""
         try:
@@ -62,7 +103,10 @@ class Simulation:
 
         occupancy: Counter[str] = Counter()
         for drone in drones:
-            if not drone.in_transit and drone.position != self.level.end:
+            if (
+                not drone.in_transit
+                and drone.position != self.level.end
+            ):
                 occupancy[drone.position] += 1
 
         source_departures: Counter[str] = Counter()
@@ -71,7 +115,10 @@ class Simulation:
         accepted: list[tuple[Drone, str, str]] = []
 
         for drone in sorted(drones, key=lambda item: item.drone_id):
-            if drone.in_transit or drone.position == self.level.end:
+            if (
+                drone.in_transit
+                or drone.position == self.level.end
+            ):
                 continue
             next_hub = drone.next_hop()
             if next_hub is None:
@@ -122,44 +169,20 @@ class Simulation:
 
         return events
 
-    def run_with_states(self) -> list[dict[int, str]]:
-        """Return drone positions after each turn for visualization."""
-        route = self._route_for_drone()
+    def _simulate(
+        self, routes: list[list[str]], collect_states: bool = False
+    ) -> tuple[int, list[dict[int, str]], list[str]]:
+        """Run assigned routes and return turns, states, and output lines."""
         drones = [
             Drone(
                 drone_id=index,
                 position=self.level.start,
                 route=route.copy(),
             )
-            for index in range(1, self.level.nb_drones + 1)
+            for index, route in enumerate(routes, start=1)
         ]
 
         states: list[dict[int, str]] = []
-        turn = 0
-        while True:
-            turn += 1
-            self._turn_events(drones, turn)
-            states.append(
-                {drone.drone_id: drone.position for drone in drones}
-            )
-            if all(drone.position == self.level.end for drone in drones):
-                break
-            if turn > 10000:
-                raise RuntimeError("Simulation did not converge.")
-        return states
-
-    def run(self) -> list[str]:
-        """Execute the simulation and return per-turn output lines."""
-        route = self._route_for_drone()
-        drones = [
-            Drone(
-                drone_id=index,
-                position=self.level.start,
-                route=route.copy(),
-            )
-            for index in range(1, self.level.nb_drones + 1)
-        ]
-
         turns: list[str] = []
         turn = 0
         while True:
@@ -167,8 +190,22 @@ class Simulation:
             events = self._turn_events(drones, turn)
             if events:
                 turns.append(" ".join(events))
+            if collect_states:
+                states.append(
+                    {drone.drone_id: drone.position for drone in drones}
+                )
             if all(drone.position == self.level.end for drone in drones):
                 break
             if turn > 10000:
                 raise RuntimeError("Simulation did not converge.")
-        return turns
+        return turn, states, turns
+
+    def run_with_states(self) -> list[dict[int, str]]:
+        """Return drone positions after each turn for visualization."""
+        routes = self._routes_for_drones()
+        return self._simulate(routes, collect_states=True)[1]
+
+    def run(self) -> list[str]:
+        """Execute the simulation and return per-turn output lines."""
+        routes = self._routes_for_drones()
+        return self._simulate(routes)[2]

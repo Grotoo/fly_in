@@ -41,9 +41,40 @@ class Graph:
             return 10**9
         if zone.zone_type == ZoneType.RESTRICTED:
             return 2
-        if zone.zone_type == ZoneType.PRIORITY:
-            return 0
         return 1
+
+    def path_score(self, path: list[str]) -> tuple[int, int, int]:
+        """Score a path by travel cost, priority preference, and length."""
+        cost = sum(self.edge_cost(name) for name in path[1:])
+        priority_zones = sum(
+            self.level.hubs[name].zone_type == ZoneType.PRIORITY
+            for name in path[1:]
+        )
+        return cost, -priority_zones, len(path)
+
+    def all_paths(
+        self, start: str, end: str, limit: int = 256
+    ) -> list[list[str]]:
+        """Return bounded simple paths ordered by movement cost."""
+        paths: list[list[str]] = []
+
+        def visit(current: str, path: list[str]) -> None:
+            if len(paths) >= limit:
+                return
+            if current == end:
+                paths.append(path.copy())
+                return
+            for connection in self.adjacency.get(current, []):
+                neighbor = self.other_end(current, connection)
+                if neighbor in path:
+                    continue
+                if self.level.hubs[neighbor].zone_type == ZoneType.BLOCKED:
+                    continue
+                visit(neighbor, path + [neighbor])
+
+        visit(start, [start])
+        paths.sort(key=self.path_score)
+        return paths
 
     def shortest_path(self, start: str, end: str) -> list[str]:
         """Compute a shortest route from start to end."""
