@@ -32,6 +32,11 @@ class Simulation:
     def __init__(self, level: Level) -> None:
         self.level = level
         self.graph = Graph(level)
+        self.status_zone = next(
+            name for name in level.hubs if name not in (level.start, level.end)
+        )
+        self.status_connection = level.connections[0]
+        self.last_status = ""
 
     def _route_for_drone(self) -> list[str]:
         """Compute the shortest valid route for a drone."""
@@ -167,10 +172,31 @@ class Simulation:
             drone.route_index = self._route_index(drone.route, next_hub)
             events.append(f"D{drone.drone_id}-{next_hub}")
 
+        zone = self.level.hubs[self.status_zone]
+        connection = self.status_connection
+        connection_key = f"{connection.point1}-{connection.point2}"
+        reverse_key = f"{connection.point2}-{connection.point1}"
+        zone_used = sum(
+            drone.position == self.status_zone
+            and not drone.in_transit
+            for drone in drones
+        )
+        link_used = (
+            connection_usage[connection_key]
+            + connection_usage[reverse_key]
+        )
+        self.last_status = (
+            f"Zone {self.status_zone}: {zone_used}/{zone.max_drones} drones, "
+            f"Connection {connection_key}: "
+            f"{link_used}/{connection.max_link_capacity} capacity used"
+        )
         return events
 
     def _simulate(
-        self, routes: list[list[str]], collect_states: bool = False
+        self,
+        routes: list[list[str]],
+        collect_states: bool = False,
+        show_usage: bool = False,
     ) -> tuple[int, list[dict[int, str]], list[str]]:
         """Run assigned routes and return turns, states, and output lines."""
         drones = [
@@ -190,6 +216,8 @@ class Simulation:
             events = self._turn_events(drones, turn)
             if events:
                 turns.append(" ".join(events))
+            if show_usage:
+                turns.append(self.last_status)
             if collect_states:
                 states.append(
                     {drone.drone_id: drone.position for drone in drones}
@@ -205,7 +233,7 @@ class Simulation:
         routes = self._routes_for_drones()
         return self._simulate(routes, collect_states=True)[1]
 
-    def run(self) -> list[str]:
+    def run(self, show_usage: bool = False) -> list[str]:
         """Execute the simulation and return per-turn output lines."""
         routes = self._routes_for_drones()
-        return self._simulate(routes)[2]
+        return self._simulate(routes, show_usage=show_usage)[2]

@@ -61,7 +61,7 @@ def main() -> int:
     if len(sys.argv) < 2:
         print(
             f"Usage: python3 {sys.argv[0]} "
-            "[--gui] [--color|--no-color] [level_file]"
+            "[--gui] [--show-usage] [--color|--no-color] [level_file]"
         )
         return 1
 
@@ -82,7 +82,7 @@ def main() -> int:
     if not gui_mode and not args:
         print(
             f"Usage: python3 {sys.argv[0]} "
-            "[--gui] [--color|--no-color] [level_file]"
+            "[--gui] [--show-usage] [--color|--no-color] [level_file]"
         )
         return 1
 
