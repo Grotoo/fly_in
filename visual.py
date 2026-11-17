@@ -1,12 +1,46 @@
 from __future__ import annotations
 
+import math
 import os
+from dataclasses import dataclass
 
 import pygame
 
 from models import Level
 from parser import ParseError, Parser
 from scheduler import Simulation
+
+INK = (31, 41, 59)
+INK_LIGHT = (248, 250, 252)
+LINE_COLOR = (130, 144, 160)
+RESTRICTED_RING = (194, 65, 12)
+PRIORITY_RING = (8, 145, 178)
+DRONE_COLORS = [
+    (239, 68, 68),
+    (245, 158, 11),
+    (34, 197, 94),
+    (59, 130, 246),
+    (139, 92, 246),
+    (236, 72, 153),
+    (20, 184, 166),
+    (249, 115, 22),
+    (16, 185, 129),
+    (99, 102, 241),
+]
+MIN_FONT = 8
+MAX_ZOOM = 8.0
+
+
+@dataclass
+class _Layout:
+    """Where the map sits on screen before zoom and pan are applied."""
+
+    scale: float
+    min_x: int
+    min_y: int
+    left: float
+    bottom: float
+    radius: float
 
 
 class SimulationVisualizer:
@@ -28,14 +62,25 @@ class SimulationVisualizer:
 
         self.level: Level | None = None
         self.turns: list[dict[int, str]] = []
+        self.map_name = ""
         self.error_message: str | None = None
+
+        self.zoom = 1.0
+        self.pan_x = 0.0
+        self.pan_y = 0.0
+        self.dragging = False
+        self._layout: _Layout | None = None
+        self._layout_size = (0, 0)
+        self._fonts: dict[int, pygame.font.Font] = {}
 
         self.maps = self._discover_maps()
         self.selected_map_index = 0
 
         pygame.init()
         pygame.display.set_caption("Fly-In Drone Simulation")
-        self.screen = pygame.display.set_mode((self.width, self.height))
+        self.screen = pygame.display.set_mode(
+            (self.width, self.height), pygame.RESIZABLE
+        )
         self.clock = pygame.time.Clock()
         self.font = pygame.font.SysFont("arial", 28, True)
         self.small_font = pygame.font.SysFont("arial", 20, True)
@@ -67,28 +112,138 @@ class SimulationVisualizer:
 
         self.level = level
         self.turns = turns
+        self.map_name = os.path.basename(map_path)
         self.turn_index = 0
         self.transition_progress = 0.0
         self.last_tick = pygame.time.get_ticks()
         self.start_time = self.last_tick
         self.error_message = None
+        self._reset_view()
         self.mode = "simulation"
 
-    def _world_to_screen(self, x: float, y: float) -> tuple[int, int]:
-        """Convert map coordinates into screen coordinates."""
-        level = self._require_level()
-        min_x = min(hub.loc_x for hub in level.hubs.values())
-        max_x = max(hub.loc_x for hub in level.hubs.values())
-        min_y = min(hub.loc_y for hub in level.hubs.values())
-        max_y = max(hub.loc_y for hub in level.hubs.values())
+    def _reset_view(self) -> None:
+        """Forget zoom, pan and the cached layout."""
+        self.zoom = 1.0
+        self.pan_x = 0.0
+        self.pan_y = 0.0
+        self.dragging = False
+        self._layout = None
 
-        width = max(max_x - min_x, 1)
-        height = max(max_y - min_y, 1)
-        scale_x = 1280 / width
-        scale_y = 710 / height
-        px = 220 + (x - min_x) * scale_x
-        py = self.height - 220 - (y - min_y) * scale_y
-        return int(px), int(py)
+    # ------------------------------------------------------------ layout
+
+    def _min_spacing(self) -> float:
+        """Smallest distance between two hubs in map coordinates."""
+        level = self._require_level()
+        points = [(hub.loc_x, hub.loc_y) for hub in level.hubs.values()]
+        best = math.inf
+        for index, first in enumerate(points):
+            for second in points[index + 1:]:
+                distance = math.dist(first, second)
+                if 0 < distance < best:
+                    best = distance
+        return 1.0 if best == math.inf else best
+
+    def _get_layout(self) -> _Layout:
+        """Return the cached layout, recomputing it after a resize."""
+        size = (self.width, self.height)
+        if self._layout is None or self._layout_size != size:
+            self._layout = self._compute_layout()
+            self._layout_size = size
+        return self._layout
+
+    def _compute_layout(self) -> _Layout:
+        """Fit the map uniformly into the window and size the nodes.
+
+        The node radius follows the closest pair of hubs, so a crowded
+        map gets smaller nodes instead of overlapping ones.
+        """
+        level = self._require_level()
+        xs = [hub.loc_x for hub in level.hubs.values()]
+        ys = [hub.loc_y for hub in level.hubs.values()]
+        min_x, min_y = min(xs), min(ys)
+        span_x = max(max(xs) - min_x, 1)
+        span_y = max(max(ys) - min_y, 1)
+        top, bottom_margin, side = 90.0, 70.0, 40.0
+        avail_w = self.width - 2 * side
+        avail_h = self.height - top - bottom_margin
+        spacing = self._min_spacing()
+
+        pad = 60.0
+        scale, radius = 1.0, 12.0
+        for _ in range(2):
+            scale = max(
+                min((avail_w - 2 * pad) / span_x,
+                    (avail_h - 2 * pad) / span_y),
+                1.0,
+            )
+            radius = min(max(spacing * scale * 0.4, 12.0), 60.0)
+            pad = radius * 2.2 + 10
+        used_w = (max(xs) - min_x) * scale
+        used_h = (max(ys) - min_y) * scale
+        return _Layout(
+            scale=scale,
+            min_x=min_x,
+            min_y=min_y,
+            left=(self.width - used_w) / 2,
+            bottom=top + (avail_h + used_h) / 2,
+            radius=radius,
+        )
+
+    def _to_screen(self, base_x: float, base_y: float) -> tuple[float, float]:
+        """Apply zoom and pan around the window center."""
+        center_x, center_y = self.width / 2, self.height / 2
+        return (
+            center_x + (base_x - center_x) * self.zoom + self.pan_x,
+            center_y + (base_y - center_y) * self.zoom + self.pan_y,
+        )
+
+    def _hub_center(self, name: str) -> tuple[float, float]:
+        """Screen position of a hub."""
+        layout = self._get_layout()
+        hub = self._require_level().hubs[name]
+        return self._to_screen(
+            layout.left + (hub.loc_x - layout.min_x) * layout.scale,
+            layout.bottom - (hub.loc_y - layout.min_y) * layout.scale,
+        )
+
+    def _hub_radius(self, name: str) -> float:
+        """Screen radius of a hub (start and end are drawn larger)."""
+        level = self._require_level()
+        radius = self._get_layout().radius * self.zoom
+        return radius * 1.25 if name in (level.start, level.end) else radius
+
+    # ------------------------------------------------------------ drawing
+
+    def _font(self, size: int) -> pygame.font.Font:
+        """Return a cached bold font of the given size."""
+        font = self._fonts.get(size)
+        if font is None:
+            font = pygame.font.SysFont("arial", size, True)
+            self._fonts[size] = font
+        return font
+
+    def _draw_text(
+        self,
+        text: str,
+        color: tuple[int, int, int],
+        center: tuple[float, float],
+        size: int,
+        max_width: float,
+    ) -> None:
+        """Draw centered text, shrinking or shortening it to fit."""
+        if max_width < 10:
+            return
+        size = max(size, MIN_FONT)
+        font = self._font(size)
+        while size > MIN_FONT and font.size(text)[0] > max_width:
+            size -= 1
+            font = self._font(size)
+        shown = text
+        while len(shown) > 1 and font.size(shown)[0] > max_width:
+            shown = shown.rstrip("…")[:-1] + "…"
+        label = font.render(shown, True, color)
+        rect = label.get_rect(center=(int(center[0]), int(center[1])))
+        self.screen.blit(label, rect)
 
     def _hub_color(self, hub_name: str) -> tuple[int, int, int]:
         """Return a display color for a hub."""
@@ -114,111 +269,152 @@ class SimulationVisualizer:
             return (100, 116, 139)
         return (125, 211, 252)
 
+    def _text_color(self, fill: tuple[int, int, int]) -> tuple[int, int, int]:
+        """Dark text on light fills, light text on dark fills."""
+        brightness = 0.299 * fill[0] + 0.587 * fill[1] + 0.114 * fill[2]
+        return INK if brightness > 140 else INK_LIGHT
+
     def _draw_connections(self) -> None:
-        """Draw all connection lines between hubs."""
+        """Draw connection lines; thicker lines carry more drones."""
         level = self._require_level()
+        base = max(2.0, self._get_layout().radius * self.zoom * 0.12)
         for connection in level.connections:
-            start = self._world_to_screen(
-                level.hubs[connection.point1].loc_x,
-                level.hubs[connection.point1].loc_y,
+            start = self._hub_center(connection.point1)
+            end = self._hub_center(connection.point2)
+            factor = 1 + 0.6 * (connection.max_link_capacity - 1)
+            width = int(min(base * factor, base * 4))
+            pygame.draw.line(
+                self.screen,
+                LINE_COLOR,
+                (int(start[0]), int(start[1])),
+                (int(end[0]), int(end[1])),
+                width=max(width, 2),
             )
-            end = self._world_to_screen(
-                level.hubs[connection.point2].loc_x,
-                level.hubs[connection.point2].loc_y,
-            )
-            pygame.draw.line(self.screen, (91, 105, 117), start, end, width=10)
 
     def _draw_hubs(self) -> None:
-        """Draw each hub as a node."""
+        """Draw each hub as a node with its name inside."""
         level = self._require_level()
         for name, hub in level.hubs.items():
-            center = self._world_to_screen(hub.loc_x, hub.loc_y)
-            radius = 82 if name in (level.start, level.end) else 52
+            center_x, center_y = self._hub_center(name)
+            radius = self._hub_radius(name)
+            if (
+                center_x + radius < 0
+                or center_y + radius < 0
+                or center_x - radius > self.width
+                or center_y - radius > self.height
+            ):
+                continue
+            center = (int(center_x), int(center_y))
+            outline = max(2, int(radius * 0.08))
+            ring = {
+                "restricted": RESTRICTED_RING,
+                "priority": PRIORITY_RING,
+            }.get(hub.zone_type.value)
+            if ring is not None:
+                pygame.draw.circle(
+                    self.screen,
+                    ring,
+                    center,
+                    int(radius + outline * 2 + 2),
+                    width=max(2, int(radius * 0.07)),
+                )
+            fill = self._hub_color(name)
+            pygame.draw.circle(self.screen, fill, center, int(radius))
             pygame.draw.circle(
-                self.screen,
-                self._hub_color(name),
-                center,
-                radius,
+                self.screen, INK, center, int(radius), width=outline
             )
-            pygame.draw.circle(
-                self.screen,
-                (31, 41, 59),
-                center,
-                radius,
-                width=5,
+            if hub.zone_type.value == "blocked":
+                offset = int(radius * 0.7)
+                for sign in (1, -1):
+                    pygame.draw.line(
+                        self.screen,
+                        INK,
+                        (center[0] - offset, center[1] - sign * offset),
+                        (center[0] + offset, center[1] + sign * offset),
+                        width=outline,
+                    )
+            color = self._text_color(fill)
+            show_capacity = (
+                name not in (level.start, level.end)
+                and hub.max_drones > 1
+                and radius >= 28
             )
-            label = self.small_font.render(name, True, (31, 41, 59))
-            label_rect = label.get_rect(center=(center[0], center[1] + 95))
-            self.screen.blit(label, label_rect)
-
-    def _position_for_drone(self, drone_id: int) -> tuple[int, int]:
-        """Return the current interpolated center for a drone."""
-        level = self._require_level()
-        if self.turn_index >= len(self.turns) - 1:
-            state = self.turns[-1]
-            position = state.get(drone_id)
-            if position is None:
-                return (0, 0)
-            hub = level.hubs[position]
-            return self._world_to_screen(hub.loc_x, hub.loc_y)
-
-        prev_state = self.turns[self.turn_index]
-        next_state = self.turns[self.turn_index + 1]
-        previous_position = prev_state.get(drone_id)
-        next_position = next_state.get(drone_id)
-        if previous_position is None and next_position is not None:
-            previous_position = next_position
-        if next_position is None and previous_position is not None:
-            next_position = previous_position
-        if previous_position is None or next_position is None:
-            return (0, 0)
-
-        if previous_position == next_position:
-            hub = level.hubs[previous_position]
-            return self._world_to_screen(hub.loc_x, hub.loc_y)
-
-        prev_center = self._world_to_screen(
-            level.hubs[previous_position].loc_x,
-            level.hubs[previous_position].loc_y,
-        )
-        next_center = self._world_to_screen(
-            level.hubs[next_position].loc_x,
-            level.hubs[next_position].loc_y,
-        )
-        t = self.transition_progress
-        x = int(prev_center[0] + (next_center[0] - prev_center[0]) * t)
-        y = int(prev_center[1] + (next_center[1] - prev_center[1]) * t)
-        return (x, y)
+            shift = radius * 0.16 if show_capacity else 0.0
+            self._draw_text(
+                name,
+                color,
+                (center_x, center_y - shift),
+                int(radius * 0.5),
+                radius * 1.7,
+            )
+            if show_capacity:
+                self._draw_text(
+                    f"max {hub.max_drones}",
+                    color,
+                    (center_x, center_y + radius * 0.42),
+                    int(radius * 0.3),
+                    radius * 1.3,
+                )
 
     def _draw_drones(self) -> None:
-        """Draw drone markers from the current interpolated state."""
+        """Draw drones stacked on their hub, gliding along connections."""
         level = self._require_level()
-        palette = [
-            (239, 68, 68),
-            (245, 158, 11),
-            (34, 197, 94),
-            (59, 130, 246),
-            (139, 92, 246),
-            (236, 72, 153),
-            (20, 184, 166),
-            (249, 115, 22),
-            (16, 185, 129),
-            (99, 102, 241),
-        ]
-        for drone_id in range(1, level.nb_drones + 1):
-            center = self._position_for_drone(drone_id)
-            color = palette[(drone_id - 1) % len(palette)]
-            pygame.draw.circle(self.screen, color, center, 28)
-            pygame.draw.circle(self.screen, (17, 24, 39), center, 28, width=4)
-            marker = self.small_font.render(f"{drone_id}", True, (17, 24, 39))
-            label_rect = marker.get_rect(center=center)
-            self.screen.blit(marker, label_rect)
+        last = len(self.turns) - 1
+        before = min(self.turn_index, last)
+        after = min(before + 1, last)
+        progress = self.transition_progress if after != before else 0.0
+        old_state, new_state = self.turns[before], self.turns[after]
+        chip = min(max(self._get_layout().radius * self.zoom * 0.3, 7.0), 18.0)
 
-    def _draw_turn_label(self) -> None:
-        """Draw the current turn and status banner."""
-        text = f"Turn {self.turn_index + 1}/{len(self.turns)}"
-        label = self.font.render(text, True, (17, 24, 39))
+        resting: list[tuple[int, float, float]] = []
+        moving: list[tuple[int, float, float]] = []
+        for drone_id in range(1, level.nb_drones + 1):
+            old_hub, new_hub = old_state[drone_id], new_state[drone_id]
+            start_x, start_y = self._hub_center(old_hub)
+            end_x, end_y = self._hub_center(new_hub)
+            point_x = start_x + (end_x - start_x) * progress
+            point_y = start_y + (end_y - start_y) * progress
+            target = moving if old_hub != new_hub else resting
+            target.append((drone_id, point_x, point_y))
+
+        for drone_id, point_x, point_y in resting + moving:
+            center = (int(point_x), int(point_y))
+            color = DRONE_COLORS[(drone_id - 1) % len(DRONE_COLORS)]
+            pygame.draw.circle(self.screen, color, center, int(chip))
+            pygame.draw.circle(
+                self.screen, INK, center, int(chip), width=2
+            )
+            self._draw_text(
+                str(drone_id),
+                INK,
+                (point_x, point_y),
+                int(chip * 1.1),
+                chip * 1.7,
+            )
+
+    def _draw_hud(self) -> None:
+        """Draw the turn counter and the legend."""
+        total = max(len(self.turns) - 1, 1)
+        shown = min(self.turn_index + 1, total)
+        label = self.font.render(f"Turn {shown}/{total}", True, INK)
         self.screen.blit(label, (24, 18))
+        name = self.small_font.render(self.map_name, True, (71, 85, 105))
+        self.screen.blit(name, (24, 56))
+
+        y = self.height - 34
+        x = 24
+        for ring, text in (
+            (RESTRICTED_RING, "restricted (2 turns)"),
+            (PRIORITY_RING, "priority"),
+        ):
+            pygame.draw.circle(self.screen, ring, (x + 10, y + 10), 10, 3)
+            caption = self.small_font.render(text, True, INK)
+            self.screen.blit(caption, (x + 28, y))
+            x += 28 + caption.get_width() + 28
+        hint = "thick line = more link capacity   |   " \
+            "wheel: zoom   drag: move   R: reset   Esc: quit"
+        caption = self.small_font.render(hint, True, (71, 85, 105))
+        self.screen.blit(caption, (x, y))
 
     def _render_simulation(self) -> None:
         """Render one simulation frame."""
@@ -226,7 +422,7 @@ class SimulationVisualizer:
         self._draw_connections()
         self._draw_hubs()
         self._draw_drones()
-        self._draw_turn_label()
+        self._draw_hud()
 
     def _render_menu(self) -> None:
         """Render the map selection start screen."""
@@ -295,6 +491,8 @@ class SimulationVisualizer:
             raise RuntimeError("No active simulation level.")
         return self.level
 
+    # ------------------------------------------------------------ input
+
     def _handle_menu_key(self, key: int) -> None:
         """Handle key presses while in menu mode."""
         if key in (pygame.K_ESCAPE, pygame.K_q):
@@ -318,18 +516,51 @@ class SimulationVisualizer:
         """Handle key presses while in simulation mode."""
         if key in (pygame.K_ESCAPE, pygame.K_q):
             self.running = False
+        elif key == pygame.K_r:
+            self._reset_view()
+
+    def _zoom_at(self, mouse: tuple[int, int], steps: int) -> None:
+        """Zoom the view while keeping the point under the mouse fixed."""
+        new_zoom = min(max(self.zoom * 1.15 ** steps, 1.0), MAX_ZOOM)
+        ratio = new_zoom / self.zoom
+        offset_x = mouse[0] - self.width / 2
+        offset_y = mouse[1] - self.height / 2
+        self.pan_x = offset_x - (offset_x - self.pan_x) * ratio
+        self.pan_y = offset_y - (offset_y - self.pan_y) * ratio
+        self.zoom = new_zoom
+        if self.zoom == 1.0:
+            self.pan_x = self.pan_y = 0.0
+
+    def _handle_mouse(self, event: pygame.event.Event) -> None:
+        """Zoom with the wheel and move the map by dragging."""
+        if event.type == pygame.MOUSEWHEEL:
+            self._zoom_at(pygame.mouse.get_pos(), event.y)
+        elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            self.dragging = True
+        elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+            self.dragging = False
+        elif event.type == pygame.MOUSEMOTION and self.dragging:
+            self.pan_x += event.rel[0]
+            self.pan_y += event.rel[1]
 
     def run(self) -> None:
         """Run the application until closed."""
         while self.running:
+            self.width, self.height = self.screen.get_size()
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     self.running = False
+                elif event.type == pygame.VIDEORESIZE:
+                    surface = pygame.display.get_surface()
+                    if surface is not None:
+                        self.screen = surface
                 elif event.type == pygame.KEYDOWN:
                     if self.mode == "menu":
                         self._handle_menu_key(event.key)
                     else:
                         self._handle_simulation_key(event.key)
+                elif self.mode == "simulation":
+                    self._handle_mouse(event)
 
             now = pygame.time.get_ticks()
             delta = now - self.last_tick

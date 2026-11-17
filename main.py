@@ -77,7 +77,7 @@ def main() -> int:
     args = [
         arg
         for arg in raw_args
-        if arg not in ("--gui", "--color", "--no-color")
+        if arg not in ("--gui", "--show-usage", "--color", "--no-color")
     ]
     if not gui_mode and not args:
         print(

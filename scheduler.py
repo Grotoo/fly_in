@@ -5,6 +5,14 @@ from dataclasses import dataclass
 
 from models import Level, ZoneType
 from pathfinding import Graph
+from planner import (
+    Move,
+    Plan,
+    PlanError,
+    Planner,
+    ReservationPlanner,
+    TimeExpandedPlanner,
+)
 
 
 @dataclass
@@ -13,227 +21,179 @@ class Drone:
 
     drone_id: int
     position: str
-    route: list[str]
-    route_index: int = 0
+    moves: list[Move]
+    next_move: int = 0
     in_transit: bool = False
     transit_target: str | None = None
-    transit_arrival_turn: int | None = None
 
-    def next_hop(self) -> str | None:
-        """Return the next zone on the drone route, if any."""
-        if self.route_index + 1 >= len(self.route):
+    def due_move(self, turn: int) -> Move | None:
+        """Return the move this drone has to make during `turn`."""
+        if self.next_move >= len(self.moves):
             return None
-        return self.route[self.route_index + 1]
+        move = self.moves[self.next_move]
+        return move if move.turn == turn else None
 
 
 class Simulation:
-    """Turn-based scheduler that respects capacities and movement rules."""
+    """Turn-based engine that replays a plan and enforces every rule.
+
+    A planner proposes a schedule; the engine only accepts it when each
+    turn respects zone capacity, link capacity and the two-turn rule for
+    restricted zones. The first planner whose plan passes is used.
+    """
+
+    planners: tuple[type[Planner], ...] = (
+        TimeExpandedPlanner,
+        ReservationPlanner,
+    )
 
     def __init__(self, level: Level) -> None:
         self.level = level
         self.graph = Graph(level)
-        self.status_zone = next(
+        inner = [
             name for name in level.hubs if name not in (level.start, level.end)
+        ]
+        self.status_zone = inner[0] if inner else None
+        self.status_connection = (
+            level.connections[0] if level.connections else None
         )
-        self.status_connection = level.connections[0]
         self.last_status = ""
 
-    def _route_for_drone(self) -> list[str]:
-        """Compute the shortest valid route for a drone."""
-        return self.graph.shortest_path(self.level.start, self.level.end)
+    def _solve(
+        self, show_usage: bool = False
+    ) -> tuple[list[dict[int, str]], list[str]]:
+        """Plan and execute; fall back to the next planner on rule errors."""
+        error = PlanError("no planner available")
+        for planner_class in self.planners:
+            plan = planner_class(self.level, self.graph).plan()
+            try:
+                return self._execute(plan, show_usage)
+            except PlanError as caught:
+                error = caught
+        raise error
 
-    def _routes_for_drones(self) -> list[list[str]]:
-        """Assign routes using schedule-aware greedy selection."""
-        candidates = self.graph.all_paths(self.level.start, self.level.end)
-        if not candidates:
-            raise ValueError(
-                f"No valid path connects '{self.level.start}' "
-                f"to '{self.level.end}' in this map."
-            )
-        shortest_cost = self.graph.path_score(candidates[0])[0]
-        candidates = [
-            route
-            for route in candidates
-            if self.graph.path_score(route)[0] <= shortest_cost + 1
+    def _execute(
+        self, plan: Plan, show_usage: bool
+    ) -> tuple[list[dict[int, str]], list[str]]:
+        """Replay a plan turn by turn; return the states and output lines."""
+        if len(plan) != self.level.nb_drones:
+            raise PlanError("plan does not cover every drone")
+        drones = [
+            Drone(drone_id=index, position=self.level.start, moves=moves)
+            for index, moves in enumerate(plan, start=1)
         ]
-
-        baseline = min(
-            candidates,
-            key=lambda route: self._simulate(
-                [route] * self.level.nb_drones
-            )[0],
+        states = [self._snapshot(drones)]
+        lines: list[str] = []
+        last_turn = 1 + max(
+            (move.turn for moves in plan for move in moves), default=0
         )
-        routes: list[list[str]] = [baseline]
-        for _ in range(1, self.level.nb_drones):
-            best_route = candidates[0]
-            best_result: tuple[int, int, tuple[int, int, int]] | None = None
-            for candidate in candidates:
-                try:
-                    turns = self._simulate(routes + [candidate])[0]
-                except RuntimeError:
-                    continue
-                result = (
-                    turns,
-                    sum(route == candidate for route in routes),
-                    self.graph.path_score(candidate),
-                )
-                if best_result is None or result < best_result:
-                    best_result = result
-                    best_route = candidate
-            routes.append(best_route)
-        return routes
+        for turn in range(1, last_turn + 1):
+            events, usage = self._advance(drones, turn)
+            lines.append(" ".join(events))
+            if show_usage:
+                status = self._status(drones, usage)
+                if status:
+                    lines.append(status)
+            states.append(self._snapshot(drones))
+            if self._all_delivered(drones):
+                return states, lines
+        raise PlanError("plan leaves drones undelivered")
 
-    def _route_index(self, route: list[str], position: str) -> int:
-        """Find the index of position inside route."""
-        try:
-            return route.index(position)
-        except ValueError:
-            return 0
-
-    def _turn_events(self, drones: list[Drone], turn: int) -> list[str]:
-        """Advance the current turn and return the movement events."""
+    def _advance(
+        self, drones: list[Drone], turn: int
+    ) -> tuple[list[str], Counter[frozenset[str]]]:
+        """Play one turn: arrivals, departures, then the capacity check."""
         events: list[str] = []
-
+        usage: Counter[frozenset[str]] = Counter()
         for drone in drones:
-            if drone.in_transit and drone.transit_arrival_turn == turn:
-                assert drone.transit_target is not None
+            if drone.in_transit and drone.transit_target is not None:
                 drone.position = drone.transit_target
                 drone.in_transit = False
                 drone.transit_target = None
-                drone.transit_arrival_turn = None
-                drone.route_index = self._route_index(
-                    drone.route, drone.position
-                )
                 events.append(f"D{drone.drone_id}-{drone.position}")
-
-        occupancy: Counter[str] = Counter()
-        for drone in drones:
-            if (
-                not drone.in_transit
-                and drone.position != self.level.end
-            ):
-                occupancy[drone.position] += 1
-
-        source_departures: Counter[str] = Counter()
-        target_arrivals: Counter[str] = Counter()
-        connection_usage: Counter[str] = Counter()
-        accepted: list[tuple[Drone, str, str]] = []
-
-        for drone in sorted(drones, key=lambda item: item.drone_id):
-            if (
-                drone.in_transit
-                or drone.position == self.level.end
-            ):
                 continue
-            next_hub = drone.next_hop()
-            if next_hub is None:
-                continue
-            connection = self.graph.connection_between(
-                drone.position, next_hub
+            move = drone.due_move(turn)
+            if move is not None:
+                events.append(self._depart(drone, move, usage))
+        self._check_zones(drones)
+        return events, usage
+
+    def _depart(
+        self, drone: Drone, move: Move, usage: Counter[frozenset[str]]
+    ) -> str:
+        """Start a move and return its output token."""
+        if drone.position != move.source:
+            raise PlanError(
+                f"D{drone.drone_id} is not in '{move.source}' "
+                f"during turn {move.turn}"
             )
-            if connection is None:
-                continue
-            key = f"{drone.position}-{next_hub}"
+        connection = self.graph.connection_between(move.source, move.target)
+        if connection is None:
+            raise PlanError(
+                f"no connection {move.source}-{move.target}"
+            )
+        target = self.level.hubs[move.target]
+        if target.zone_type == ZoneType.BLOCKED:
+            raise PlanError(f"zone '{move.target}' is blocked")
+        key = frozenset((move.source, move.target))
+        usage[key] += 1
+        if usage[key] > connection.max_link_capacity:
+            raise PlanError(
+                f"connection {move.source}-{move.target} over capacity "
+                f"in turn {move.turn}"
+            )
+        drone.next_move += 1
+        if target.zone_type == ZoneType.RESTRICTED:
+            drone.in_transit = True
+            drone.transit_target = move.target
+            return f"D{drone.drone_id}-{move.source}-{move.target}"
+        drone.position = move.target
+        return f"D{drone.drone_id}-{move.target}"
 
-            if connection_usage[key] >= connection.max_link_capacity:
-                continue
+    def _check_zones(self, drones: list[Drone]) -> None:
+        """Make sure no zone holds more drones than its capacity."""
+        occupancy = Counter(
+            drone.position
+            for drone in drones
+            if not drone.in_transit and drone.position != self.level.end
+        )
+        for name, count in occupancy.items():
+            capacity = self.level.zone_capacity(name)
+            if capacity is not None and count > capacity:
+                raise PlanError(f"zone '{name}' is over capacity")
 
-            target_capacity = self.level.zone_capacity(next_hub)
-            if target_capacity is not None:
-                projected = (
-                    occupancy[next_hub]
-                    - source_departures[next_hub]
-                    + target_arrivals[next_hub]
-                    + 1
-                )
-                if projected > target_capacity:
-                    continue
+    def _all_delivered(self, drones: list[Drone]) -> bool:
+        """Tell whether every drone has reached the end hub."""
+        return all(drone.position == self.level.end for drone in drones)
 
-            if self.level.hubs[next_hub].zone_type == ZoneType.RESTRICTED:
-                source_departures[drone.position] += 1
-                target_arrivals[next_hub] += 1
-                connection_usage[key] += 1
-                drone.in_transit = True
-                drone.transit_target = next_hub
-                drone.transit_arrival_turn = turn + 1
-                accepted.append((drone, next_hub, key))
-                continue
+    def _snapshot(self, drones: list[Drone]) -> dict[int, str]:
+        """Zone of every drone (a drone in flight stays at its origin)."""
+        return {drone.drone_id: drone.position for drone in drones}
 
-            source_departures[drone.position] += 1
-            target_arrivals[next_hub] += 1
-            connection_usage[key] += 1
-            accepted.append((drone, next_hub, key))
-
-        for drone, next_hub, key in accepted:
-            if drone.in_transit:
-                events.append(f"D{drone.drone_id}-{key}")
-                continue
-            drone.position = next_hub
-            drone.route_index = self._route_index(drone.route, next_hub)
-            events.append(f"D{drone.drone_id}-{next_hub}")
-
+    def _status(
+        self, drones: list[Drone], usage: Counter[frozenset[str]]
+    ) -> str:
+        """Describe the usage of one sample zone and one sample link."""
+        if self.status_zone is None or self.status_connection is None:
+            return ""
         zone = self.level.hubs[self.status_zone]
         connection = self.status_connection
-        connection_key = f"{connection.point1}-{connection.point2}"
-        reverse_key = f"{connection.point2}-{connection.point1}"
+        key = frozenset((connection.point1, connection.point2))
         zone_used = sum(
-            drone.position == self.status_zone
-            and not drone.in_transit
+            drone.position == self.status_zone and not drone.in_transit
             for drone in drones
-        )
-        link_used = (
-            connection_usage[connection_key]
-            + connection_usage[reverse_key]
         )
         self.last_status = (
             f"Zone {self.status_zone}: {zone_used}/{zone.max_drones} drones, "
-            f"Connection {connection_key}: "
-            f"{link_used}/{connection.max_link_capacity} capacity used"
+            f"Connection {connection.point1}-{connection.point2}: "
+            f"{usage[key]}/{connection.max_link_capacity} capacity used"
         )
-        return events
-
-    def _simulate(
-        self,
-        routes: list[list[str]],
-        collect_states: bool = False,
-        show_usage: bool = False,
-    ) -> tuple[int, list[dict[int, str]], list[str]]:
-        """Run assigned routes and return turns, states, and output lines."""
-        drones = [
-            Drone(
-                drone_id=index,
-                position=self.level.start,
-                route=route.copy(),
-            )
-            for index, route in enumerate(routes, start=1)
-        ]
-
-        states: list[dict[int, str]] = []
-        turns: list[str] = []
-        turn = 0
-        while True:
-            turn += 1
-            events = self._turn_events(drones, turn)
-            if events:
-                turns.append(" ".join(events))
-            if show_usage:
-                turns.append(self.last_status)
-            if collect_states:
-                states.append(
-                    {drone.drone_id: drone.position for drone in drones}
-                )
-            if all(drone.position == self.level.end for drone in drones):
-                break
-            if turn > 10000:
-                raise RuntimeError("Simulation did not converge.")
-        return turn, states, turns
+        return self.last_status
 
     def run_with_states(self) -> list[dict[int, str]]:
         """Return drone positions after each turn for visualization."""
-        routes = self._routes_for_drones()
-        return self._simulate(routes, collect_states=True)[1]
+        return self._solve()[0]
 
     def run(self, show_usage: bool = False) -> list[str]:
         """Execute the simulation and return per-turn output lines."""
-        routes = self._routes_for_drones()
-        return self._simulate(routes, show_usage=show_usage)[2]
+        return self._solve(show_usage)[1]

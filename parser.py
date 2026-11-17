@@ -45,7 +45,6 @@ class Parser:
         """Parse a level file from disk."""
         self._reset()
         first = True
-        pending_connections: list[tuple[int, str]] = []
         with open(path, encoding="utf-8") as handle:
             for number, raw in enumerate(handle, start=1):
                 line = raw.strip()
@@ -63,9 +62,6 @@ class Parser:
                         f"Line {number}: first line must define nb_drones"
                     )
                 first = False
-                if key == "connection":
-                    pending_connections.append((number, value.strip()))
-                    continue
                 try:
                     handler(value.strip())
                 except ValidationError as error:
@@ -81,15 +77,6 @@ class Parser:
             raise ParseError("missing 'start_hub'")
         if self.end is None:
             raise ParseError("missing 'end_hub'")
-        for number, value in pending_connections:
-            try:
-                self.handle_connection(value)
-            except ValidationError as error:
-                raise ParseError(
-                    f"Line {number}: {format_validation_error(error)}"
-                ) from error
-            except ValueError as error:
-                raise ParseError(f"Line {number}: {error}") from error
         try:
             return Level(
                 nb_drones=self.nb_drones,

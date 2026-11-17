@@ -43,38 +43,37 @@ class Graph:
             return 2
         return 1
 
-    def path_score(self, path: list[str]) -> tuple[int, int, int]:
-        """Score a path by travel cost, priority preference, and length."""
-        cost = sum(self.edge_cost(name) for name in path[1:])
-        priority_zones = sum(
-            self.level.hubs[name].zone_type == ZoneType.PRIORITY
-            for name in path[1:]
-        )
-        return cost, -priority_zones, len(path)
+    def is_blocked(self, zone_name: str) -> bool:
+        """Tell whether drones may never enter the given zone."""
+        return self.level.hubs[zone_name].zone_type == ZoneType.BLOCKED
 
-    def all_paths(
-        self, start: str, end: str, limit: int = 256
-    ) -> list[list[str]]:
-        """Return bounded simple paths ordered by movement cost."""
-        paths: list[list[str]] = []
+    def travel_times(
+        self, origin: str, reverse: bool = False
+    ) -> dict[str, int]:
+        """Minimum turns from origin to every zone (Dijkstra).
 
-        def visit(current: str, path: list[str]) -> None:
-            if len(paths) >= limit:
-                return
-            if current == end:
-                paths.append(path.copy())
-                return
+        With reverse=True the times are measured the other way round:
+        from every zone to origin. Zones that cannot be reached are
+        missing from the result, blocked zones are never crossed.
+        """
+        times: dict[str, int] = {origin: 0}
+        queue: list[tuple[int, str]] = [(0, origin)]
+        while queue:
+            cost, current = heappop(queue)
+            if cost > times.get(current, 10**9):
+                continue
+            if reverse and self.is_blocked(current):
+                continue
             for connection in self.adjacency.get(current, []):
                 neighbor = self.other_end(current, connection)
-                if neighbor in path:
+                if self.is_blocked(neighbor):
                     continue
-                if self.level.hubs[neighbor].zone_type == ZoneType.BLOCKED:
-                    continue
-                visit(neighbor, path + [neighbor])
-
-        visit(start, [start])
-        paths.sort(key=self.path_score)
-        return paths
+                step = self.edge_cost(current if reverse else neighbor)
+                candidate = cost + step
+                if candidate < times.get(neighbor, 10**9):
+                    times[neighbor] = candidate
+                    heappush(queue, (candidate, neighbor))
+        return times
 
     def shortest_path(self, start: str, end: str) -> list[str]:
         """Compute a shortest route from start to end."""
